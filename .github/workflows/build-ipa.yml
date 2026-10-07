@@ -111,31 +111,65 @@ jobs:
           set -euo pipefail
           export HOMEBREW_NO_AUTO_UPDATE=1
           export HOMEBREW_NO_INSTALL_CLEANUP=1
-          brew install ninja llvm libarchive ripgrep jq
+          # 两次尝试，镜像网络偶尔抽风
+          brew install ninja llvm libarchive ripgrep jq || brew install ninja llvm libarchive ripgrep jq
           if [ ! -x /usr/bin/jq ] && [ -x /opt/homebrew/bin/jq ]; then
             sudo ln -sf /opt/homebrew/bin/jq /usr/bin/jq
           fi
 
       # ------------------------------------------------------------------
-      # 5. 验证工具链（缺哪个提前红，别等 40 分钟后才报）
+      # 5. 验证工具链
+      #
+      #    【这一次失败的根因就在这里】
+      #
+      #    `brew install llvm` 装成功了，但 llvm 是 keg-only 公式：
+      #    `ld.lld` 只待在 $(brew --prefix llvm)/bin 里，Homebrew 不会把它
+      #    链接进默认 PATH，所以 `command -v ld.lld` 找不到。
+      #
+      #    而且 Scripts/build-ish-sandbox.sh 第 259 行自己也写着
+      #      lld="$(command -v ld.lld || true)"
+      #      [ -n "$lld" ] && [ -x "$lld" ] || fail "ld.lld is required ..."
+      #    所以光放宽这里的检查没用，必须真的把 LLVM 的 bin 加进 PATH
+      #    （脚本第 273 行也会自己拼 PATH，但前提是 command -v 能找到 lld）。
+      #
+      #    这里把解析出的 LLVM bin 写进 $GITHUB_ENV，
+      #    后续所有步骤（包括构建脚本和 xcodebuild）都自动带上。
       # ------------------------------------------------------------------
-      - name: 验证工具链就位
+      - name: 验证工具链并注入 LLVM PATH
         run: |
           set -euo pipefail
-          echo "which ninja:  $(command -v ninja)"
-          echo "which ld.lld: $(command -v ld.lld || echo '未找到 ld.lld')"
-          echo "which rg:     $(command -v rg)"
-          ls -d /opt/homebrew/opt/llvm/bin/clang
-          ls -d /opt/homebrew/opt/libarchive
+
+          LLVM_PREFIX="$(brew --prefix llvm)"
+          echo "LLVM keg: $LLVM_PREFIX"
+          test -d "$LLVM_PREFIX/bin" || { echo "::error::LLVM 未安装：$LLVM_PREFIX/bin 不存在"; exit 1; }
+
+          # 列出关键文件，方便日志里直接看到
+          ls -l "$LLVM_PREFIX/bin/ld.lld" "$LLVM_PREFIX/bin/clang" "$LLVM_PREFIX/bin/llvm-ar" 2>/dev/null || true
+          ls -l /opt/homebrew/bin/ld.lld 2>/dev/null || echo "（/opt/homebrew/bin/ld.lld 不存在——keg-only 是正常的）"
+
+          # 注入到后续所有步骤
+          echo "$LLVM_PREFIX/bin" >> "$GITHUB_PATH"
+          export PATH="$LLVM_PREFIX/bin:$PATH"
+
+          echo "--- 注入后逐个确认 ---"
+          echo "ninja:  $(command -v ninja  || echo 缺失)"
+          echo "meson:  $(command -v meson  || echo '缺失——脚本会自己下官方 release')"
+          echo "rg:     $(command -v rg     || echo 缺失)"
+          echo "ld.lld: $(command -v ld.lld || echo 缺失)"
+          echo "llvm clang: $(command -v clang)"
+
+          # 硬性前置：这些缺了后面必然失败
+          command -v ld.lld >/dev/null || { echo "::error::ld.lld 依然缺失，iSH VDSO 无法构建"; exit 1; }
+          test -x "$LLVM_PREFIX/bin/clang" || { echo "::error::LLVM clang 缺失，iSH 无法构建"; exit 1; }
+          command -v rg >/dev/null || { echo "::error::ripgrep 缺失"; exit 1; }
+          command -v ninja >/dev/null || { echo "::error::ninja 缺失"; exit 1; }
           test -x /usr/bin/jq || { echo "::error::/usr/bin/jq 不存在，官方脚本会失败"; exit 1; }
-          /usr/bin/jq --version
-          command -v python3
           for t in /usr/bin/shasum /usr/bin/tar /usr/bin/patch /usr/bin/zip /usr/bin/unzip /usr/bin/sed /usr/bin/plutil; do
             test -x "$t" || { echo "::error::官方脚本要求的工具缺失：$t"; exit 1; }
           done
-          # 两条硬性前置，缺一个后面必然失败，这里提前说清楚
-          test -x /opt/homebrew/opt/llvm/bin/clang || { echo "::error::LLVM clang 缺失，iSH 无法构建"; exit 1; }
-          test -x "$(command -v ld.lld)"      || { echo "::error::ld.lld 缺失，iSH VDSO 无法构建"; exit 1; }
+          command -v python3 >/dev/null || { echo "::error::python3 缺失"; exit 1; }
+          /usr/bin/jq --version
+          xcodebuild -version
 
       # ------------------------------------------------------------------
       # 6. 按官方锁定版本拉取上游源码
@@ -227,6 +261,12 @@ jobs:
           ISH_LIBARCHIVE_PREFIX: /opt/homebrew/opt/libarchive
         run: |
           set -euo pipefail
+          # 双保险：PATH 里必须能看到 ld.lld，否则脚本第 259 行会直接 fail。
+          # 第 5 步已经把 LLVM bin 写进 $GITHUB_PATH，这里再显式兜一层。
+          export PATH="$(brew --prefix llvm)/bin:$PATH"
+          echo "ld.lld -> $(command -v ld.lld)"
+          echo "clang  -> $(command -v clang)"
+          echo "ninja  -> $(command -v ninja)"
           if [ "${{ inputs.build_rootfs }}" = "true" ]; then
             ./Scripts/build-ish-sandbox.sh all
           else
@@ -373,8 +413,9 @@ jobs:
           if-no-files-found: error
 
       # 16. iSH 产物也留一份，出问题时能看出框架到底编出来没有
+      #     只在真正编过框架之后才传，避免失败得早时刷出无关警告
       - name: 上传 iSH 构建产物（排查用）
-        if: always()
+        if: success() || failure()
         uses: actions/upload-artifact@v4
         with:
           name: ish-artifacts-${{ inputs.version }}
