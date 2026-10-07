@@ -154,7 +154,9 @@ jobs:
 
           say ""
           say "========== 逐个安装（互不牵连） =========="
-          for pkg in ninja llvm libarchive ripgrep jq meson; do
+          # 注意 lld 是单独一个公式！Homebrew 的 LLVM 从 23.x 起
+          # 不再附带 ld.lld，必须额外装 `lld`。（这是真实踩过的坑）
+          for pkg in ninja llvm lld libarchive ripgrep jq meson; do
             say "---------- brew install $pkg ----------"
             if brew list --formula "$pkg" >/dev/null 2>&1; then
               say "已安装，跳过: $pkg"
@@ -170,44 +172,51 @@ jobs:
 
           say ""
           say "========== 逐个核对安装结果 =========="
-          for pkg in ninja llvm libarchive ripgrep jq meson; do
+          for pkg in ninja llvm lld libarchive ripgrep jq meson; do
             if brew list --formula "$pkg" >/dev/null 2>&1; then
               say "  $pkg 已安装  前缀=$(brew --prefix "$pkg" 2>/dev/null || echo '?')"
             else
               say "  $pkg 未安装"
             fi
           done
-          say "--- /opt/homebrew/bin 里与 ninja/ripgrep/meson/jq 相关的文件 ---"
-          ls -l /opt/homebrew/bin 2>/dev/null | grep -Ei 'ninja|ripgrep|rg$|meson|jq' | tee -a "$DIAG" || say "  （无匹配）"
+          say "--- /opt/homebrew/bin 里与 ninja/ripgrep/meson/jq/lld 相关的文件 ---"
+          ls -l /opt/homebrew/bin 2>/dev/null | grep -Ei 'ninja|ripgrep|rg$|meson|jq|lld' | tee -a "$DIAG" || say "  （无匹配）"
 
           say ""
           say "========== 定位 ld.lld =========="
-          LLVM_PREFIX="$(brew --prefix llvm 2>/dev/null || true)"
-          say "brew --prefix llvm -> '${LLVM_PREFIX:-<空>}'"
-          if [ -n "$LLVM_PREFIX" ] && [ -d "$LLVM_PREFIX/bin" ]; then
-            say "--- $LLVM_PREFIX/bin 里的关键文件 ---"
-            ls -l "$LLVM_PREFIX/bin" 2>/dev/null | grep -E 'clang$|ld\.lld$|llvm-ar' | tee -a "$DIAG" || say "  （无匹配）"
-          else
-            say "!! llvm keg 不存在"
-          fi
+          # 逐个公式问其前缀，再直接查看 bin 里到底有没有 ld.lld。
+          # llvm 与 lld 是两个不同的 keg，不能用 llvm 的前缀去找 lld。
+          for pkg in lld llvm; do
+            P="$(brew --prefix "$pkg" 2>/dev/null || true)"
+            say "brew --prefix $pkg -> '${P:-<空>}'"
+            if [ -n "$P" ] && [ -d "$P/bin" ]; then
+              say "--- $P/bin 里含 lld/clang 的文件 ---"
+              ls -l "$P/bin" 2>/dev/null | grep -Ei 'ld\.lld|lld|clang$' | tee -a "$DIAG" || say "  （无匹配）"
+            fi
+          done
           say "--- 默认 PATH 里的 ld.lld ---"
-          say "  $(command -v ld.lld || echo '没有（keg-only，符合预期）')"
-          say "--- 搜索 ld.lld ---"
-          find /opt/homebrew /usr/local -name 'ld.lld' -maxdepth 6 2>/dev/null | head -n 20 | tee -a "$DIAG" || true
-          say "--- 搜索 clang（LLVM 版） ---"
-          find /opt/homebrew /usr/local -path '*/llvm*/bin/clang' -maxdepth 7 2>/dev/null | head -n 10 | tee -a "$DIAG" || true
+          say "  $(command -v ld.lld || echo '没有')"
+          say "--- 搜索 ld.lld（全深度） ---"
+          find /opt/homebrew /usr/local -name 'ld.lld' 2>/dev/null | head -n 20 | tee -a "$DIAG" || true
 
           say ""
           say "========== 组装 LLVM bin 并注入 GITHUB_PATH =========="
           # 按优先级找第一个含 ld.lld 的目录
           LLVM_BIN=""
-          for d in "$LLVM_PREFIX/bin" /opt/homebrew/opt/llvm/bin /opt/homebrew/bin /usr/local/opt/llvm/bin /usr/local/bin; do
+          for d in \
+            "$(brew --prefix lld 2>/dev/null)/bin" \
+            /opt/homebrew/opt/lld/bin \
+            /opt/homebrew/bin \
+            "$(brew --prefix llvm 2>/dev/null)/bin" \
+            /opt/homebrew/opt/llvm/bin \
+            /usr/local/opt/lld/bin \
+            /usr/local/bin ; do
             if [ -n "$d" ] && [ -x "$d/ld.lld" ]; then LLVM_BIN="$d"; break; fi
           done
 
-          # 还没找到：深挖 Cellar / opt，常见位置继续找
+          # 还没找到：深挖 Cellar / opt，全深度搜索
           if [ -z "$LLVM_BIN" ]; then
-            say "候选目录都没命中，深挖 /opt/homebrew/Cellar 与 /opt/homebrew/opt ..."
+            say "候选目录都没命中，深挖 Cellar 与 opt ..."
             DEEP="$(find /opt/homebrew/Cellar /opt/homebrew/opt /usr/local/Cellar /usr/local/opt \
                       -name 'ld.lld' -type f 2>/dev/null | head -n 1 || true)"
             if [ -n "$DEEP" ]; then
@@ -216,45 +225,22 @@ jobs:
             fi
           fi
 
-          # 还没有：重试一次 brew install llvm（带详细输出）
+          # 还没有：显式再装一次 lld（这是我上一版漏掉的公式）
           if [ -z "$LLVM_BIN" ]; then
-            say "--- 重试 brew install llvm（详细输出） ---"
-            brew install --verbose llvm 2>&1 | tail -n 40 | tee -a "$DIAG" || true
-            LLVM_PREFIX2="$(brew --prefix llvm 2>/dev/null || true)"
-            if [ -n "$LLVM_PREFIX2" ] && [ -x "$LLVM_PREFIX2/bin/ld.lld" ]; then
-              LLVM_BIN="$LLVM_PREFIX2/bin"
+            say "--- 重试 brew install lld（详细输出） ---"
+            brew install --verbose lld 2>&1 | tail -n 40 | tee -a "$DIAG" || true
+            LLD_PREFIX="$(brew --prefix lld 2>/dev/null || true)"
+            if [ -n "$LLD_PREFIX" ] && [ -x "$LLD_PREFIX/bin/ld.lld" ]; then
+              LLVM_BIN="$LLD_PREFIX/bin"
               say "重试后命中：$LLVM_BIN"
             fi
           fi
 
-          # 最后兜底：直接下 LLVM 官方预编译包（不依赖 Homebrew）
-          if [ -z "$LLVM_BIN" ]; then
-            say "--- Homebrew 路线失败，改用 LLVM 官方预编译包兜底 ---"
-            LLVM_DIR="$RUNNER_TEMP/llvm-official"
-            mkdir -p "$LLVM_DIR"
-            ARCH="$(uname -m)"
-            if [ "$ARCH" = "arm64" ]; then
-              LLVM_ASSET="clang+llvm-18.1.8-arm64-apple-macos11.tar.xz"
-            else
-              LLVM_ASSET="clang+llvm-18.1.8-x86_64-apple-darwin.tar.xz"
-            fi
-            LLVM_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/$LLVM_ASSET"
-            say "下载：$LLVM_URL"
-            if curl -fL --retry 5 --retry-all-errors --retry-delay 3 \
-                 --output "$LLVM_DIR/llvm.tar.xz" "$LLVM_URL" 2>&1 | tail -n 5 | tee -a "$DIAG"; then
-              say "解包中（可能需要一两分钟）..."
-              tar -xJf "$LLVM_DIR/llvm.tar.xz" -C "$LLVM_DIR" 2>&1 | tail -n 5 | tee -a "$DIAG" || true
-              FOUND="$(find "$LLVM_DIR" -name 'ld.lld' -type f 2>/dev/null | head -n 1 || true)"
-              if [ -n "$FOUND" ]; then
-                LLVM_BIN="$(dirname "$FOUND")"
-                say "官方包命中：$LLVM_BIN"
-              else
-                say "官方包解出来后也没找到 ld.lld"
-              fi
-            else
-              say "官方包下载失败"
-            fi
-          fi
+          # 说明：这里曾经有一段「下载 LLVM 官方预编译包」的兜底，已删除。
+          # 理由是实测证伪——LLVM 18.1.8 的 macOS 资产
+          #   clang+llvm-18.1.8-arm64-apple-macos11.tar.xz (799.8 MB)
+          # 解包后**并不包含 ld.lld**（实测 799MB 白下）。真正可靠的来源是
+          # Homebrew 的独立 `lld` 公式，上面已经装了。
 
           if [ -n "$LLVM_BIN" ]; then
             say "选定 LLVM_BIN = $LLVM_BIN"
@@ -417,10 +403,12 @@ jobs:
           # 第 5 步已经把 LLVM bin 写进 $GITHUB_PATH，这里再显式兜一层，
           # 并且不依赖 brew --prefix（万一它这次解析不出来）。
           for d in \
+            "$(brew --prefix lld 2>/dev/null)/bin" \
+            /opt/homebrew/opt/lld/bin \
+            /opt/homebrew/bin \
             "$(brew --prefix llvm 2>/dev/null)/bin" \
             /opt/homebrew/opt/llvm/bin \
-            /opt/homebrew/bin \
-            /usr/local/opt/llvm/bin \
+            /usr/local/opt/lld/bin \
             /usr/local/bin ; do
             [ -x "$d/ld.lld" ] && export PATH="$d:$PATH"
           done
