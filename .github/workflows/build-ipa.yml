@@ -17,14 +17,17 @@ jobs:
       - name: 检出仓库
         uses: actions/checkout@v4
 
-      - name: 选择 Xcode Beta 版本
+      - name: 查找并选择 Xcode 版本
         run: |
-          sudo xcode-select -s /Applications/Xcode-beta.app/Contents/Developer
+          echo "当前系统中可用的 Xcode："
+          ls /Applications/ | grep Xcode
+          XCODE_PATH=$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)
+          echo "正在使用：$XCODE_PATH"
+          sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
           xcodebuild -version
 
       - name: 构建并归档（无签名）
         run: |
-          DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer \
           xcodebuild archive \
             -project HarnessMobile.xcodeproj \
             -scheme HarnessMobile \
