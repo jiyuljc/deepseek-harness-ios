@@ -95,81 +95,158 @@ jobs:
           df -h /
 
       # ------------------------------------------------------------------
-      # 4. 安装官方构建脚本要求的工具
+      # 4. （已合并到第 5 步）
       #
-      #    官方 Vendor/OpenMinisISH/README.md 明确要求：
-      #      LLVM Clang + ld.lld（编 ARM64 Linux VDSO 用）
-      #      Meson、Ninja、libarchive
-      #    README 里还有一条：跑 Xcode 构建前要先过
-      #    Scripts/audit-no-remote-execution.sh，它依赖 ripgrep。
+      #    原来这里有一次 `brew install ninja llvm libarchive ripgrep jq`，
+      #    但一次装多个包时，只要其中一个失败整条命令就非零退出，
+      #    在 `set -e` 下直接判失败，而且日志里看不出到底是谁失败。
       #
-      #    jq 也一起装：构建脚本里全部写死了 /usr/bin/jq，
-      #    而 Homebrew 的 jq 在 /opt/homebrew/bin，所以要补一个软链。
+      #    现在统一挪到第 5 步：逐个安装、不 set -e、打印完整诊断。
+      #    官方要求没变：LLVM Clang + ld.lld（ARM64 Linux VDSO）、
+      #    Meson / Ninja / libarchive，以及审计脚本需要的 ripgrep。
       # ------------------------------------------------------------------
-      - name: 安装构建依赖（Homebrew）
+      - name: 预检查 Homebrew
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          echo "brew -> $(command -v brew || echo '缺失')"
+          brew --version 2>&1 | head -n 1 || true
+          echo "HOME=$HOME"
+          ls -d /opt/homebrew 2>/dev/null || echo "（无 /opt/homebrew）"
+          ls -d /usr/local/Homebrew 2>/dev/null || echo "（无 /usr/local/Homebrew）"
+
+      # ------------------------------------------------------------------
+      # 5. 安装并定位 LLVM（ld.lld）
+      #
+      #    背景（两次真实失败换来的）：
+      #
+      #    a) `llvm` 是 Homebrew 的 **keg-only** 公式，`ld.lld` 不会被链接进
+      #       /opt/homebrew/bin，只待在 `brew --prefix llvm`/bin 里。
+      #       所以 `command -v ld.lld` 找不到它 —— 而
+      #       Scripts/build-ish-sandbox.sh 第 259 行**也**这么检查：
+      #         lld="$(command -v ld.lld || true)"
+      #         [ -n "$lld" ] && [ -x "$lld" ] || fail "ld.lld is required ..."
+      #       因此必须真的把它加进 PATH，放宽我们自己的检查没有意义。
+      #
+      #    b) 这一步**绝对不能用 `set -e`**。上一次它就在
+      #       `ninja llvm libarchive ripgrep jq` 一次装多个包时因为其中一个
+      #       失败而整条命令非零退出，直接判失败，但日志里看不到到底是谁失败。
+      #       现在改成：逐个装（各自失败不影响其他）、不 set -e、
+      #       全面打印诊断、最后才用明确的条件判断决定成败。
+      # ------------------------------------------------------------------
+      - name: 安装 LLVM 并定位 ld.lld
+        run: |
+          # 注意：这里故意不写 set -e
+          set -uo pipefail
+
+          echo "========== 环境诊断 =========="
+          uname -m
+          echo "brew  -> $(command -v brew || echo '缺失')"
+          brew --version 2>&1 | head -n 2 || true
           export HOMEBREW_NO_AUTO_UPDATE=1
           export HOMEBREW_NO_INSTALL_CLEANUP=1
-          # 两次尝试，镜像网络偶尔抽风
-          brew install ninja llvm libarchive ripgrep jq || brew install ninja llvm libarchive ripgrep jq
-          if [ ! -x /usr/bin/jq ] && [ -x /opt/homebrew/bin/jq ]; then
-            sudo ln -sf /opt/homebrew/bin/jq /usr/bin/jq
+
+          echo ""
+          echo "========== 逐个安装（互不牵连） =========="
+          for pkg in ninja llvm libarchive ripgrep jq meson; do
+            echo "---------- brew install $pkg ----------"
+            if brew list --formula "$pkg" >/dev/null 2>&1; then
+              echo "已安装，跳过: $pkg"
+              continue
+            fi
+            brew install "$pkg" 2>&1 | tail -n 15
+            if brew list --formula "$pkg" >/dev/null 2>&1; then
+              echo "OK: $pkg"
+            else
+              echo "::warning::brew install $pkg 似乎没成功，继续尝试其余步骤"
+            fi
+          done
+
+          echo ""
+          echo "========== 逐个核对安装结果 =========="
+          for pkg in ninja llvm libarchive ripgrep jq meson; do
+            if brew list --formula "$pkg" >/dev/null 2>&1; then
+              printf '  %-10s 已安装  前缀=%s\n' "$pkg" "$(brew --prefix "$pkg" 2>/dev/null || echo '?')"
+            else
+              printf '  %-10s 未安装\n' "$pkg"
+            fi
+          done
+          echo "--- /opt/homebrew/bin 里与 ninja/rg/meson 相关的文件 ---"
+          ls -l /opt/homebrew/bin 2>/dev/null | grep -Ei 'ninja|ripgrep|rg$|meson|jq' || echo "  （无匹配）"
+
+          echo ""
+          echo "========== 定位 ld.lld =========="
+          LLVM_PREFIX="$(brew --prefix llvm 2>/dev/null || true)"
+          echo "brew --prefix llvm -> '${LLVM_PREFIX:-<空>}'"
+          if [ -n "$LLVM_PREFIX" ] && [ -d "$LLVM_PREFIX/bin" ]; then
+            echo "--- $LLVM_PREFIX/bin 里的关键文件 ---"
+            ls -l "$LLVM_PREFIX/bin" 2>/dev/null | grep -E 'clang$|ld\.lld$|^.*lld$|llvm-ar' || echo "  （无匹配）"
+          else
+            echo "::warning::llvm keg 不存在，稍后改用 Xcode 自带 clang 兜底"
+          fi
+          echo "--- 现有 PATH 里能找到的 lld ---"
+          command -v ld.lld || echo "  默认 PATH 里没有 ld.lld（keg-only，符合预期）"
+          echo "--- 全盘搜索 ld.lld（最多列 10 个） ---"
+          find /opt/homebrew /usr/local -name 'ld.lld' -type f -maxdepth 6 2>/dev/null | head -n 10 || true
+
+          echo ""
+          echo "========== 组装 LLVM bin 并注入 GITHUB_PATH =========="
+          # 优先 Homebrew LLVM 的 bin；找不到就退回 /opt/homebrew/bin
+          if [ -n "$LLVM_PREFIX" ] && [ -x "$LLVM_PREFIX/bin/ld.lld" ]; then
+            LLVM_BIN="$LLVM_PREFIX/bin"
+          elif [ -x /opt/homebrew/bin/ld.lld ]; then
+            LLVM_BIN="/opt/homebrew/bin"
+          else
+            LLVM_BIN=""
           fi
 
-      # ------------------------------------------------------------------
-      # 5. 验证工具链
-      #
-      #    【这一次失败的根因就在这里】
-      #
-      #    `brew install llvm` 装成功了，但 llvm 是 keg-only 公式：
-      #    `ld.lld` 只待在 $(brew --prefix llvm)/bin 里，Homebrew 不会把它
-      #    链接进默认 PATH，所以 `command -v ld.lld` 找不到。
-      #
-      #    而且 Scripts/build-ish-sandbox.sh 第 259 行自己也写着
-      #      lld="$(command -v ld.lld || true)"
-      #      [ -n "$lld" ] && [ -x "$lld" ] || fail "ld.lld is required ..."
-      #    所以光放宽这里的检查没用，必须真的把 LLVM 的 bin 加进 PATH
-      #    （脚本第 273 行也会自己拼 PATH，但前提是 command -v 能找到 lld）。
-      #
-      #    这里把解析出的 LLVM bin 写进 $GITHUB_ENV，
-      #    后续所有步骤（包括构建脚本和 xcodebuild）都自动带上。
-      # ------------------------------------------------------------------
-      - name: 验证工具链并注入 LLVM PATH
-        run: |
-          set -euo pipefail
+          if [ -n "$LLVM_BIN" ]; then
+            echo "选定 LLVM_BIN = $LLVM_BIN"
+            echo "llvm bin: $LLVM_BIN" >> "$GITHUB_PATH"
+          else
+            echo "::error::找不到 ld.lld。iSH 的 ARM64 Linux VDSO 必须要它，无法继续。"
+            echo "::error::请把本步骤的完整日志发给协助者（含上面的搜索输出）。"
+            exit 1
+          fi
 
-          LLVM_PREFIX="$(brew --prefix llvm)"
-          echo "LLVM keg: $LLVM_PREFIX"
-          test -d "$LLVM_PREFIX/bin" || { echo "::error::LLVM 未安装：$LLVM_PREFIX/bin 不存在"; exit 1; }
+          # 给后续所有步骤补上 /usr/local/bin（Intel 前缀兜底）
+          echo "/usr/local/bin" >> "$GITHUB_PATH" || true
+          # jq：官方脚本里全部写死 /usr/bin/jq
+          if [ ! -x /usr/bin/jq ] && [ -x /opt/homebrew/bin/jq ]; then
+            sudo ln -sf /opt/homebrew/bin/jq /usr/bin/jq || echo "::warning::jq 软链创建失败"
+          fi
 
-          # 列出关键文件，方便日志里直接看到
-          ls -l "$LLVM_PREFIX/bin/ld.lld" "$LLVM_PREFIX/bin/clang" "$LLVM_PREFIX/bin/llvm-ar" 2>/dev/null || true
-          ls -l /opt/homebrew/bin/ld.lld 2>/dev/null || echo "（/opt/homebrew/bin/ld.lld 不存在——keg-only 是正常的）"
-
-          # 注入到后续所有步骤
-          echo "$LLVM_PREFIX/bin" >> "$GITHUB_PATH"
-          export PATH="$LLVM_PREFIX/bin:$PATH"
-
-          echo "--- 注入后逐个确认 ---"
-          echo "ninja:  $(command -v ninja  || echo 缺失)"
-          echo "meson:  $(command -v meson  || echo '缺失——脚本会自己下官方 release')"
-          echo "rg:     $(command -v rg     || echo 缺失)"
-          echo "ld.lld: $(command -v ld.lld || echo 缺失)"
-          echo "llvm clang: $(command -v clang)"
-
-          # 硬性前置：这些缺了后面必然失败
-          command -v ld.lld >/dev/null || { echo "::error::ld.lld 依然缺失，iSH VDSO 无法构建"; exit 1; }
-          test -x "$LLVM_PREFIX/bin/clang" || { echo "::error::LLVM clang 缺失，iSH 无法构建"; exit 1; }
-          command -v rg >/dev/null || { echo "::error::ripgrep 缺失"; exit 1; }
-          command -v ninja >/dev/null || { echo "::error::ninja 缺失"; exit 1; }
-          test -x /usr/bin/jq || { echo "::error::/usr/bin/jq 不存在，官方脚本会失败"; exit 1; }
-          for t in /usr/bin/shasum /usr/bin/tar /usr/bin/patch /usr/bin/zip /usr/bin/unzip /usr/bin/sed /usr/bin/plutil; do
-            test -x "$t" || { echo "::error::官方脚本要求的工具缺失：$t"; exit 1; }
+          # 加进当前步骤的 PATH 再做一次最终确认
+          export PATH="${LLVM_BIN}:/opt/homebrew/bin:/usr/local/bin:$PATH"
+          echo ""
+          echo "========== 最终确认 =========="
+          for t in ninja meson rg jq python3 clang ld.lld; do
+            printf '  %-10s %s\n' "$t" "$(command -v "$t" 2>/dev/null || echo '缺失')"
           done
-          command -v python3 >/dev/null || { echo "::error::python3 缺失"; exit 1; }
-          /usr/bin/jq --version
+          echo "  /usr/bin/jq  $([ -x /usr/bin/jq ] && echo 就绪 || echo 缺失)"
+          for t in /usr/bin/shasum /usr/bin/tar /usr/bin/patch /usr/bin/zip /usr/bin/unzip /usr/bin/sed /usr/bin/plutil; do
+            printf '  %-16s %s\n' "$t" "$([ -x "$t" ] && echo 就绪 || echo 缺失)"
+          done
           xcodebuild -version
+
+          echo ""
+          echo "========== 判定 =========="
+          MISSING=0
+          command -v ld.lld >/dev/null || { echo "::error::ld.lld 不可用"; MISSING=1; }
+          command -v ninja  >/dev/null || { echo "::error::ninja 不可用";  MISSING=1; }
+          command -v rg     >/dev/null || { echo "::error::ripgrep 不可用"; MISSING=1; }
+          [ -x /usr/bin/jq ]             || { echo "::error::/usr/bin/jq 不可用"; MISSING=1; }
+          command -v python3 >/dev/null  || { echo "::error::python3 不可用"; MISSING=1; }
+          for t in /usr/bin/shasum /usr/bin/tar /usr/bin/patch /usr/bin/zip /usr/bin/unzip /usr/bin/sed /usr/bin/plutil; do
+            [ -x "$t" ] || { echo "::error::官方脚本要求的工具缺失：$t"; MISSING=1; }
+          done
+          # meson 缺失不算失败：build-ish-sandbox.sh 会自己下官方 release
+          command -v meson >/dev/null || echo "::notice::meson 不在 PATH，官方脚本会自行下载官方 release（不影响）"
+
+          if [ "$MISSING" -ne 0 ]; then
+            echo "::error::工具链仍有缺失，终止。请把本步骤完整日志发给协助者。"
+            exit 1
+          fi
+          echo "工具链就绪 ✓"
 
       # ------------------------------------------------------------------
       # 6. 按官方锁定版本拉取上游源码
@@ -262,11 +339,20 @@ jobs:
         run: |
           set -euo pipefail
           # 双保险：PATH 里必须能看到 ld.lld，否则脚本第 259 行会直接 fail。
-          # 第 5 步已经把 LLVM bin 写进 $GITHUB_PATH，这里再显式兜一层。
-          export PATH="$(brew --prefix llvm)/bin:$PATH"
-          echo "ld.lld -> $(command -v ld.lld)"
+          # 第 5 步已经把 LLVM bin 写进 $GITHUB_PATH，这里再显式兜一层，
+          # 并且不依赖 brew --prefix（万一它这次解析不出来）。
+          for d in \
+            "$(brew --prefix llvm 2>/dev/null)/bin" \
+            /opt/homebrew/opt/llvm/bin \
+            /opt/homebrew/bin \
+            /usr/local/opt/llvm/bin \
+            /usr/local/bin ; do
+            [ -x "$d/ld.lld" ] && export PATH="$d:$PATH"
+          done
+          echo "ld.lld -> $(command -v ld.lld || echo '找不到！')"
           echo "clang  -> $(command -v clang)"
           echo "ninja  -> $(command -v ninja)"
+          command -v ld.lld >/dev/null || { echo "::error::构建前仍找不到 ld.lld，官方脚本会失败"; exit 1; }
           if [ "${{ inputs.build_rootfs }}" = "true" ]; then
             ./Scripts/build-ish-sandbox.sh all
           else
