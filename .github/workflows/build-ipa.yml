@@ -205,6 +205,57 @@ jobs:
             if [ -n "$d" ] && [ -x "$d/ld.lld" ]; then LLVM_BIN="$d"; break; fi
           done
 
+          # 还没找到：深挖 Cellar / opt，常见位置继续找
+          if [ -z "$LLVM_BIN" ]; then
+            say "候选目录都没命中，深挖 /opt/homebrew/Cellar 与 /opt/homebrew/opt ..."
+            DEEP="$(find /opt/homebrew/Cellar /opt/homebrew/opt /usr/local/Cellar /usr/local/opt \
+                      -name 'ld.lld' -type f 2>/dev/null | head -n 1 || true)"
+            if [ -n "$DEEP" ]; then
+              LLVM_BIN="$(dirname "$DEEP")"
+              say "深挖命中：$DEEP"
+            fi
+          fi
+
+          # 还没有：重试一次 brew install llvm（带详细输出）
+          if [ -z "$LLVM_BIN" ]; then
+            say "--- 重试 brew install llvm（详细输出） ---"
+            brew install --verbose llvm 2>&1 | tail -n 40 | tee -a "$DIAG" || true
+            LLVM_PREFIX2="$(brew --prefix llvm 2>/dev/null || true)"
+            if [ -n "$LLVM_PREFIX2" ] && [ -x "$LLVM_PREFIX2/bin/ld.lld" ]; then
+              LLVM_BIN="$LLVM_PREFIX2/bin"
+              say "重试后命中：$LLVM_BIN"
+            fi
+          fi
+
+          # 最后兜底：直接下 LLVM 官方预编译包（不依赖 Homebrew）
+          if [ -z "$LLVM_BIN" ]; then
+            say "--- Homebrew 路线失败，改用 LLVM 官方预编译包兜底 ---"
+            LLVM_DIR="$RUNNER_TEMP/llvm-official"
+            mkdir -p "$LLVM_DIR"
+            ARCH="$(uname -m)"
+            if [ "$ARCH" = "arm64" ]; then
+              LLVM_ASSET="clang+llvm-18.1.8-arm64-apple-macos11.tar.xz"
+            else
+              LLVM_ASSET="clang+llvm-18.1.8-x86_64-apple-darwin.tar.xz"
+            fi
+            LLVM_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/$LLVM_ASSET"
+            say "下载：$LLVM_URL"
+            if curl -fL --retry 5 --retry-all-errors --retry-delay 3 \
+                 --output "$LLVM_DIR/llvm.tar.xz" "$LLVM_URL" 2>&1 | tail -n 5 | tee -a "$DIAG"; then
+              say "解包中（可能需要一两分钟）..."
+              tar -xJf "$LLVM_DIR/llvm.tar.xz" -C "$LLVM_DIR" 2>&1 | tail -n 5 | tee -a "$DIAG" || true
+              FOUND="$(find "$LLVM_DIR" -name 'ld.lld' -type f 2>/dev/null | head -n 1 || true)"
+              if [ -n "$FOUND" ]; then
+                LLVM_BIN="$(dirname "$FOUND")"
+                say "官方包命中：$LLVM_BIN"
+              else
+                say "官方包解出来后也没找到 ld.lld"
+              fi
+            else
+              say "官方包下载失败"
+            fi
+          fi
+
           if [ -n "$LLVM_BIN" ]; then
             say "选定 LLVM_BIN = $LLVM_BIN"
             echo "$LLVM_BIN" >> "$GITHUB_PATH"
