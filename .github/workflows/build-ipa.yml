@@ -138,73 +138,83 @@ jobs:
           # 注意：这里故意不写 set -e
           set -uo pipefail
 
-          echo "========== 环境诊断 =========="
-          uname -m
-          echo "brew  -> $(command -v brew || echo '缺失')"
-          brew --version 2>&1 | head -n 2 || true
+          # 所有输出同时写进这个文件，构建结束后会被上传成小文件，
+          # 方便在 iPad 上直接下载查看，不必翻长日志截图。
+          mkdir -p "$GITHUB_WORKSPACE/.ci-diagnostics"
+          DIAG="$GITHUB_WORKSPACE/.ci-diagnostics/toolchain-diagnostics.txt"
+          say() { printf '%s\n' "$*" 2>/dev/null | tee -a "$DIAG"; }
+
+          say "========== 环境诊断 =========="
+          say "时间: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          say "架构: $(uname -m)"
+          say "brew: $(command -v brew || echo '缺失')"
+          brew --version 2>&1 | head -n 2 | tee -a "$DIAG" || true
           export HOMEBREW_NO_AUTO_UPDATE=1
           export HOMEBREW_NO_INSTALL_CLEANUP=1
 
-          echo ""
-          echo "========== 逐个安装（互不牵连） =========="
+          say ""
+          say "========== 逐个安装（互不牵连） =========="
           for pkg in ninja llvm libarchive ripgrep jq meson; do
-            echo "---------- brew install $pkg ----------"
+            say "---------- brew install $pkg ----------"
             if brew list --formula "$pkg" >/dev/null 2>&1; then
-              echo "已安装，跳过: $pkg"
+              say "已安装，跳过: $pkg"
               continue
             fi
-            brew install "$pkg" 2>&1 | tail -n 15
+            brew install "$pkg" 2>&1 | tail -n 25 | tee -a "$DIAG"
             if brew list --formula "$pkg" >/dev/null 2>&1; then
-              echo "OK: $pkg"
+              say "OK: $pkg"
             else
-              echo "::warning::brew install $pkg 似乎没成功，继续尝试其余步骤"
+              say "!! brew install $pkg 没成功，继续尝试其余步骤"
             fi
           done
 
-          echo ""
-          echo "========== 逐个核对安装结果 =========="
+          say ""
+          say "========== 逐个核对安装结果 =========="
           for pkg in ninja llvm libarchive ripgrep jq meson; do
             if brew list --formula "$pkg" >/dev/null 2>&1; then
-              printf '  %-10s 已安装  前缀=%s\n' "$pkg" "$(brew --prefix "$pkg" 2>/dev/null || echo '?')"
+              say "  $pkg 已安装  前缀=$(brew --prefix "$pkg" 2>/dev/null || echo '?')"
             else
-              printf '  %-10s 未安装\n' "$pkg"
+              say "  $pkg 未安装"
             fi
           done
-          echo "--- /opt/homebrew/bin 里与 ninja/rg/meson 相关的文件 ---"
-          ls -l /opt/homebrew/bin 2>/dev/null | grep -Ei 'ninja|ripgrep|rg$|meson|jq' || echo "  （无匹配）"
+          say "--- /opt/homebrew/bin 里与 ninja/ripgrep/meson/jq 相关的文件 ---"
+          ls -l /opt/homebrew/bin 2>/dev/null | grep -Ei 'ninja|ripgrep|rg$|meson|jq' | tee -a "$DIAG" || say "  （无匹配）"
 
-          echo ""
-          echo "========== 定位 ld.lld =========="
+          say ""
+          say "========== 定位 ld.lld =========="
           LLVM_PREFIX="$(brew --prefix llvm 2>/dev/null || true)"
-          echo "brew --prefix llvm -> '${LLVM_PREFIX:-<空>}'"
+          say "brew --prefix llvm -> '${LLVM_PREFIX:-<空>}'"
           if [ -n "$LLVM_PREFIX" ] && [ -d "$LLVM_PREFIX/bin" ]; then
-            echo "--- $LLVM_PREFIX/bin 里的关键文件 ---"
-            ls -l "$LLVM_PREFIX/bin" 2>/dev/null | grep -E 'clang$|ld\.lld$|^.*lld$|llvm-ar' || echo "  （无匹配）"
+            say "--- $LLVM_PREFIX/bin 里的关键文件 ---"
+            ls -l "$LLVM_PREFIX/bin" 2>/dev/null | grep -E 'clang$|ld\.lld$|llvm-ar' | tee -a "$DIAG" || say "  （无匹配）"
           else
-            echo "::warning::llvm keg 不存在，稍后改用 Xcode 自带 clang 兜底"
+            say "!! llvm keg 不存在"
           fi
-          echo "--- 现有 PATH 里能找到的 lld ---"
-          command -v ld.lld || echo "  默认 PATH 里没有 ld.lld（keg-only，符合预期）"
-          echo "--- 全盘搜索 ld.lld（最多列 10 个） ---"
-          find /opt/homebrew /usr/local -name 'ld.lld' -type f -maxdepth 6 2>/dev/null | head -n 10 || true
+          say "--- 默认 PATH 里的 ld.lld ---"
+          say "  $(command -v ld.lld || echo '没有（keg-only，符合预期）')"
+          say "--- 搜索 ld.lld ---"
+          find /opt/homebrew /usr/local -name 'ld.lld' -maxdepth 6 2>/dev/null | head -n 20 | tee -a "$DIAG" || true
+          say "--- 搜索 clang（LLVM 版） ---"
+          find /opt/homebrew /usr/local -path '*/llvm*/bin/clang' -maxdepth 7 2>/dev/null | head -n 10 | tee -a "$DIAG" || true
 
-          echo ""
-          echo "========== 组装 LLVM bin 并注入 GITHUB_PATH =========="
-          # 优先 Homebrew LLVM 的 bin；找不到就退回 /opt/homebrew/bin
-          if [ -n "$LLVM_PREFIX" ] && [ -x "$LLVM_PREFIX/bin/ld.lld" ]; then
-            LLVM_BIN="$LLVM_PREFIX/bin"
-          elif [ -x /opt/homebrew/bin/ld.lld ]; then
-            LLVM_BIN="/opt/homebrew/bin"
-          else
-            LLVM_BIN=""
-          fi
+          say ""
+          say "========== 组装 LLVM bin 并注入 GITHUB_PATH =========="
+          # 按优先级找第一个含 ld.lld 的目录
+          LLVM_BIN=""
+          for d in "$LLVM_PREFIX/bin" /opt/homebrew/opt/llvm/bin /opt/homebrew/bin /usr/local/opt/llvm/bin /usr/local/bin; do
+            if [ -n "$d" ] && [ -x "$d/ld.lld" ]; then LLVM_BIN="$d"; break; fi
+          done
 
           if [ -n "$LLVM_BIN" ]; then
-            echo "选定 LLVM_BIN = $LLVM_BIN"
-            echo "llvm bin: $LLVM_BIN" >> "$GITHUB_PATH"
+            say "选定 LLVM_BIN = $LLVM_BIN"
+            echo "$LLVM_BIN" >> "$GITHUB_PATH"
           else
-            echo "::error::找不到 ld.lld。iSH 的 ARM64 Linux VDSO 必须要它，无法继续。"
-            echo "::error::请把本步骤的完整日志发给协助者（含上面的搜索输出）。"
+            say "========================= 失败原因 ========================="
+            say "找不到 ld.lld。iSH 的 ARM64 Linux VDSO 必须要它，无法继续。"
+            say "上面的『搜索 ld.lld』与『brew 安装输出』就是诊断依据。"
+            say "如果 llvm 显示『未安装』，说明 brew 装它失败了，看它的安装输出。"
+            say "==========================================================="
+            echo "::error::找不到 ld.lld，详见本步骤日志与 toolchain-diagnostics 产物"
             exit 1
           fi
 
@@ -212,41 +222,55 @@ jobs:
           echo "/usr/local/bin" >> "$GITHUB_PATH" || true
           # jq：官方脚本里全部写死 /usr/bin/jq
           if [ ! -x /usr/bin/jq ] && [ -x /opt/homebrew/bin/jq ]; then
-            sudo ln -sf /opt/homebrew/bin/jq /usr/bin/jq || echo "::warning::jq 软链创建失败"
+            sudo ln -sf /opt/homebrew/bin/jq /usr/bin/jq || say "!! jq 软链创建失败"
           fi
 
           # 加进当前步骤的 PATH 再做一次最终确认
           export PATH="${LLVM_BIN}:/opt/homebrew/bin:/usr/local/bin:$PATH"
-          echo ""
-          echo "========== 最终确认 =========="
+          say ""
+          say "========== 最终确认 =========="
           for t in ninja meson rg jq python3 clang ld.lld; do
-            printf '  %-10s %s\n' "$t" "$(command -v "$t" 2>/dev/null || echo '缺失')"
+            say "  $t -> $(command -v "$t" 2>/dev/null || echo '缺失')"
           done
-          echo "  /usr/bin/jq  $([ -x /usr/bin/jq ] && echo 就绪 || echo 缺失)"
+          say "  /usr/bin/jq -> $([ -x /usr/bin/jq ] && echo 就绪 || echo 缺失)"
           for t in /usr/bin/shasum /usr/bin/tar /usr/bin/patch /usr/bin/zip /usr/bin/unzip /usr/bin/sed /usr/bin/plutil; do
-            printf '  %-16s %s\n' "$t" "$([ -x "$t" ] && echo 就绪 || echo 缺失)"
+            say "  $t -> $([ -x "$t" ] && echo 就绪 || echo 缺失)"
           done
-          xcodebuild -version
+          xcodebuild -version 2>&1 | tee -a "$DIAG" || true
 
-          echo ""
-          echo "========== 判定 =========="
+          say ""
+          say "========== 判定 =========="
           MISSING=0
-          command -v ld.lld >/dev/null || { echo "::error::ld.lld 不可用"; MISSING=1; }
-          command -v ninja  >/dev/null || { echo "::error::ninja 不可用";  MISSING=1; }
-          command -v rg     >/dev/null || { echo "::error::ripgrep 不可用"; MISSING=1; }
-          [ -x /usr/bin/jq ]             || { echo "::error::/usr/bin/jq 不可用"; MISSING=1; }
-          command -v python3 >/dev/null  || { echo "::error::python3 不可用"; MISSING=1; }
+          command -v ld.lld >/dev/null || { say "  ✗ ld.lld 不可用";   MISSING=1; }
+          command -v ninja  >/dev/null || { say "  ✗ ninja 不可用";    MISSING=1; }
+          command -v rg     >/dev/null || { say "  ✗ ripgrep 不可用";  MISSING=1; }
+          [ -x /usr/bin/jq ]            || { say "  ✗ /usr/bin/jq 不可用"; MISSING=1; }
+          command -v python3 >/dev/null || { say "  ✗ python3 不可用";  MISSING=1; }
           for t in /usr/bin/shasum /usr/bin/tar /usr/bin/patch /usr/bin/zip /usr/bin/unzip /usr/bin/sed /usr/bin/plutil; do
-            [ -x "$t" ] || { echo "::error::官方脚本要求的工具缺失：$t"; MISSING=1; }
+            [ -x "$t" ] || { say "  ✗ 官方脚本要求的工具缺失：$t"; MISSING=1; }
           done
           # meson 缺失不算失败：build-ish-sandbox.sh 会自己下官方 release
-          command -v meson >/dev/null || echo "::notice::meson 不在 PATH，官方脚本会自行下载官方 release（不影响）"
+          command -v meson >/dev/null || say "  ! meson 不在 PATH，官方脚本会自行下载官方 release（不影响）"
 
           if [ "$MISSING" -ne 0 ]; then
-            echo "::error::工具链仍有缺失，终止。请把本步骤完整日志发给协助者。"
+            say "========================= 失败原因 ========================="
+            say "上面标 ✗ 的就是缺失项。完整细节已写入 toolchain-diagnostics 产物。"
+            say "==========================================================="
+            echo "::error::工具链仍有缺失，详见 toolchain-diagnostics 产物"
             exit 1
           fi
-          echo "工具链就绪 ✓"
+          say "工具链就绪 ✓"
+
+      # 诊断文件单独上传：这一步在任何情况下都传，
+      # 这样即使失败你也能在 run 页面右下角直接下载一个 txt，不用翻长日志。
+      - name: 上传工具链诊断日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: toolchain-diagnostics
+          path: .ci-diagnostics/toolchain-diagnostics.txt
+          retention-days: 14
+          if-no-files-found: warn
 
       # ------------------------------------------------------------------
       # 6. 按官方锁定版本拉取上游源码
