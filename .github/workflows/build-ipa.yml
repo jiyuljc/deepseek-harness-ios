@@ -14,8 +14,10 @@ jobs:
     timeout-minutes: 240
 
     steps:
-      - name: 检出仓库
+      - name: 检出仓库（含子模块）
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: 查找并选择 Xcode 版本
         run: |
@@ -25,6 +27,22 @@ jobs:
           echo "正在使用：$XCODE_PATH"
           sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
           xcodebuild -version
+
+      - name: 构建 iSH 模拟器依赖 (根据官方文档)
+        run: |
+          # 1. 进入 iSH 子模块目录
+          cd Vendor/OpenMinisISH
+          
+          # 2. 为构建脚本添加执行权限
+          chmod +x deps/build_ish.sh
+          
+          # 3. 执行官方构建脚本，生成 HarnessISH.xcframework
+          echo "开始构建 HarnessISH.xcframework，请耐心等待..."
+          ./deps/build_ish.sh
+          
+          # 4. 验证产物是否已生成
+          echo "检查 Artifacts 目录："
+          ls -la Artifacts/ || echo "构建失败，Artifacts 目录不存在"
 
       - name: 构建并归档（无签名）
         run: |
