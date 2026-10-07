@@ -328,12 +328,22 @@ jobs:
           done
 
       # ------------------------------------------------------------------
-      # 7. 补齐 ishArm64 的嵌套子模块
+      # 7. 补齐 ishArm64 的子模块
       #
       #    build-ish-sandbox.sh 会用 git ls-tree 校验 deps/libapps 与
       #    deps/libarchive 的 gitlink 与 lock 一致，但不会帮你下载它们；
-      #    meson 一配置就要读这些目录，缺了直接报错。
-      #    （deps/linux 的 requiredForIOSBuild 是 false，可以不拉。）
+      #    meson 配置与 rootfs 打包都要读这些目录，缺了直接报错。
+      #
+      #    ishArm64 的 .gitmodules 里一共三个：
+      #      deps/libapps    ← 必须（本次用 hterm/nassh 的 terminal 资源）
+      #      deps/libarchive ← 必须（编 fakefs 要用 libarchive 源码）
+      #      deps/linux      ← 标了 `update = none`，iOS 构建不需要
+      #
+      #    libapps 里没有嵌套子模块，但 --recursive 留着无害。
+      #
+      #    ⚠️ 别拿 meson.build 去检查 libapps —— 那是 hterm/nassh 那套，
+      #       根目录只有 package.json / README.md / hterm / nassh 等。
+      #       （这一条是踩过坑之后写下来的）
       # ------------------------------------------------------------------
       - name: 补齐 iSH 子模块
         run: |
@@ -343,8 +353,19 @@ jobs:
           git submodule update --init --recursive deps/libapps deps/libarchive
           echo "--- 子模块状态 ---"
           git submodule status --recursive deps/libapps deps/libarchive
-          test -e deps/libapps/meson.build  || { echo "::error::deps/libapps 内容缺失"; exit 1; }
-          test -e deps/libarchive/CMakeLists.txt || { echo "::error::deps/libarchive 内容缺失"; exit 1; }
+
+          echo "--- deps/libapps 顶层内容 ---"
+          ls -la deps/libapps | head -n 25
+          echo "--- deps/libarchive 顶层内容 ---"
+          ls -la deps/libarchive | head -n 25
+
+          # 检查各子模块确实有内容（多条件，任一成立即视为就位）
+          test -f deps/libapps/package.json || test -d deps/libapps/hterm \
+            || { echo "::error::deps/libapps 内容缺失"; exit 1; }
+          test -e deps/libarchive/CMakeLists.txt || test -e deps/libarchive/configure.ac \
+            || { echo "::error::deps/libarchive 内容缺失"; exit 1; }
+
+          echo "子模块就位 ✓"
 
       # ------------------------------------------------------------------
       # 8. 预先下好 Alpine minirootfs
